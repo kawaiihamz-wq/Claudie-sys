@@ -243,26 +243,37 @@ async def get_status_checks():
     status_checks = await db.status_checks.find().to_list(1000)
     return [StatusCheck(**parse_from_mongo(status_check)) for status_check in status_checks]
 
-# Chat endpoints
+# Chat endpoints (protected)
 @api_router.post("/conversations", response_model=Conversation)
-async def create_conversation(input: ConversationCreate):
+async def create_conversation(input: ConversationCreate, current_user: User = Depends(get_current_user)):
     conversation = Conversation(**input.dict())
     prepared_data = prepare_for_mongo(conversation.dict())
+    prepared_data["user_id"] = current_user.id  # Associate with user
     await db.conversations.insert_one(prepared_data)
     return conversation
 
 @api_router.get("/conversations", response_model=List[Conversation])
-async def get_conversations():
-    conversations = await db.conversations.find().sort("updated_at", -1).to_list(100)
+async def get_conversations(current_user: User = Depends(get_current_user)):
+    conversations = await db.conversations.find({"user_id": current_user.id}).sort("updated_at", -1).to_list(100)
     return [Conversation(**parse_from_mongo(conv)) for conv in conversations]
 
 @api_router.get("/conversations/{conversation_id}/messages", response_model=List[ChatMessage])
-async def get_messages(conversation_id: str):
+async def get_messages(conversation_id: str, current_user: User = Depends(get_current_user)):
+    # Verify conversation belongs to user
+    conversation = await db.conversations.find_one({"id": conversation_id, "user_id": current_user.id})
+    if not conversation:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    
     messages = await db.messages.find({"conversation_id": conversation_id}).sort("timestamp", 1).to_list(1000)
     return [ChatMessage(**parse_from_mongo(msg)) for msg in messages]
 
 @api_router.delete("/conversations/{conversation_id}")
-async def delete_conversation(conversation_id: str):
+async def delete_conversation(conversation_id: str, current_user: User = Depends(get_current_user)):
+    # Verify conversation belongs to user
+    conversation = await db.conversations.find_one({"id": conversation_id, "user_id": current_user.id})
+    if not conversation:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    
     # Delete conversation and all its messages
     await db.conversations.delete_one({"id": conversation_id})
     await db.messages.delete_many({"conversation_id": conversation_id})
