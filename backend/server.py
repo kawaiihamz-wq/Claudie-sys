@@ -328,8 +328,13 @@ async def get_ai_response(content: str, model: str, task_type: str, conversation
         yield f"Error: {str(e)}"
 
 @api_router.post("/chat")
-async def chat_with_ai(chat_request: ChatMessageCreate):
+async def chat_with_ai(chat_request: ChatMessageCreate, current_user: User = Depends(get_current_user)):
     try:
+        # Verify conversation belongs to user
+        conversation = await db.conversations.find_one({"id": chat_request.conversation_id, "user_id": current_user.id})
+        if not conversation:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        
         # Save user message
         user_message = ChatMessage(
             conversation_id=chat_request.conversation_id,
