@@ -1,0 +1,253 @@
+from fastapi import FastAPI, APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
+from dotenv import load_dotenv
+from starlette.middleware.cors import CORSMiddleware
+from motor.motor_asyncio import AsyncIOMotorClient
+import os
+import logging
+from pathlib import Path
+from pydantic import BaseModel, Field
+from typing import List, Optional, AsyncGenerator
+import uuid
+from datetime import datetime, timezone
+import json
+from emergentintegrations.llm.chat import LlmChat, UserMessage
+
+
+ROOT_DIR = Path(__file__).parent
+load_dotenv(ROOT_DIR / '.env')
+
+# MongoDB connection
+mongo_url = os.environ['MONGO_URL']
+client = AsyncIOMotorClient(mongo_url)
+db = client[os.environ['DB_NAME']]
+
+# Create the main app without a prefix
+app = FastAPI()
+
+# Create a router with the /api prefix
+api_router = APIRouter(prefix="/api")
+
+# Get Emergent LLM key
+EMERGENT_LLM_KEY = os.environ.get('EMERGENT_LLM_KEY')
+
+# Define Models
+class StatusCheck(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    client_name: str
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+class StatusCheckCreate(BaseModel):
+    client_name: str
+
+class ChatMessage(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    conversation_id: str
+    content: str
+    role: str  # 'user' or 'assistant'
+    model_used: Optional[str] = None
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+class ChatMessageCreate(BaseModel):
+    content: str
+    conversation_id: str
+    model: str = "gpt-4o"  # Default model
+    task_type: str = "general"  # general, code, summarize, review
+
+class Conversation(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    title: str
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+class ConversationCreate(BaseModel):
+    title: str = "New Chat"
+
+# Helper function to prepare data for MongoDB
+def prepare_for_mongo(data):
+    if isinstance(data, dict):
+        for key, value in data.items():
+            if isinstance(value, datetime):
+                data[key] = value.isoformat()
+    return data
+
+# Helper function to parse data from MongoDB
+def parse_from_mongo(item):
+    if isinstance(item, dict):
+        for key, value in item.items():
+            if isinstance(value, str) and 'T' in value:
+                try:
+                    item[key] = datetime.fromisoformat(value.replace('Z', '+00:00'))
+                except:
+                    pass
+    return item
+
+# Add your routes to the router instead of directly to app
+@api_router.get("/")
+async def root():
+    return {"message": "Claudie AI Assistant is ready!"}
+
+@api_router.post("/status", response_model=StatusCheck)
+async def create_status_check(input: StatusCheckCreate):
+    status_dict = input.dict()
+    status_obj = StatusCheck(**status_dict)
+    prepared_data = prepare_for_mongo(status_obj.dict())
+    _ = await db.status_checks.insert_one(prepared_data)
+    return status_obj
+
+@api_router.get("/status", response_model=List[StatusCheck])
+async def get_status_checks():
+    status_checks = await db.status_checks.find().to_list(1000)
+    return [StatusCheck(**parse_from_mongo(status_check)) for status_check in status_checks]
+
+# Chat endpoints
+@api_router.post("/conversations", response_model=Conversation)
+async def create_conversation(input: ConversationCreate):
+    conversation = Conversation(**input.dict())
+    prepared_data = prepare_for_mongo(conversation.dict())
+    await db.conversations.insert_one(prepared_data)
+    return conversation
+
+@api_router.get("/conversations", response_model=List[Conversation])
+async def get_conversations():
+    conversations = await db.conversations.find().sort("updated_at", -1).to_list(100)
+    return [Conversation(**parse_from_mongo(conv)) for conv in conversations]
+
+@api_router.get("/conversations/{conversation_id}/messages", response_model=List[ChatMessage])
+async def get_messages(conversation_id: str):
+    messages = await db.messages.find({"conversation_id": conversation_id}).sort("timestamp", 1).to_list(1000)
+    return [ChatMessage(**parse_from_mongo(msg)) for msg in messages]
+
+@api_router.delete("/conversations/{conversation_id}")
+async def delete_conversation(conversation_id: str):
+    # Delete conversation and all its messages
+    await db.conversations.delete_one({"id": conversation_id})
+    await db.messages.delete_many({"conversation_id": conversation_id})
+    return {"message": "Conversation deleted successfully"}
+
+async def get_ai_response(content: str, model: str, task_type: str, conversation_id: str) -> AsyncGenerator[str, None]:
+    """Get AI response from the selected model"""
+    try:
+        # Prepare system message based on task type
+        system_messages = {
+            "general": "You are Claudie, a smart AI assistant that helps with various tasks. You are knowledgeable, helpful, and provide clear explanations.",
+            "code": "You are Claudie, a coding assistant specialized in programming. Help with code generation, debugging, optimization, and code review. Always provide clean, well-commented code with explanations.",
+            "summarize": "You are Claudie, an expert at summarizing content. Provide clear, concise summaries that capture the key points and important details.",
+            "review": "You are Claudie, a code review specialist. Analyze code for bugs, performance issues, best practices, and suggest improvements. Provide constructive feedback."
+        }
+        
+        system_message = system_messages.get(task_type, system_messages["general"])
+        
+        # Get recent conversation history for context
+        recent_messages = await db.messages.find(
+            {"conversation_id": conversation_id}
+        ).sort("timestamp", -1).limit(10).to_list(10)
+        
+        # Initialize chat with appropriate model
+        if model.startswith("gpt") or model.startswith("o1") or model.startswith("o3") or model.startswith("o4"):
+            provider = "openai"
+        elif model.startswith("claude"):
+            provider = "anthropic"
+        elif model.startswith("gemini"):
+            provider = "gemini"
+        else:
+            provider = "openai"
+            model = "gpt-4o"
+        
+        chat = LlmChat(
+            api_key=EMERGENT_LLM_KEY,
+            session_id=conversation_id,
+            system_message=system_message
+        ).with_model(provider, model)
+        
+        # Create user message
+        user_message = UserMessage(text=content)
+        
+        # Get response
+        response = await chat.send_message(user_message)
+        
+        # Stream the response
+        yield response
+        
+    except Exception as e:
+        logger.error(f"Error getting AI response: {str(e)}")
+        yield f"Error: {str(e)}"
+
+@api_router.post("/chat")
+async def chat_with_ai(chat_request: ChatMessageCreate):
+    try:
+        # Save user message
+        user_message = ChatMessage(
+            conversation_id=chat_request.conversation_id,
+            content=chat_request.content,
+            role="user"
+        )
+        
+        prepared_user_msg = prepare_for_mongo(user_message.dict())
+        await db.messages.insert_one(prepared_user_msg)
+        
+        # Generate AI response
+        async def generate_response():
+            full_response = ""
+            async for chunk in get_ai_response(
+                chat_request.content, 
+                chat_request.model, 
+                chat_request.task_type,
+                chat_request.conversation_id
+            ):
+                full_response += chunk
+                yield f"data: {json.dumps({'content': chunk, 'done': False})}\n\n"
+            
+            # Save assistant message
+            assistant_message = ChatMessage(
+                conversation_id=chat_request.conversation_id,
+                content=full_response,
+                role="assistant",
+                model_used=chat_request.model
+            )
+            
+            prepared_assistant_msg = prepare_for_mongo(assistant_message.dict())
+            await db.messages.insert_one(prepared_assistant_msg)
+            
+            # Update conversation timestamp
+            await db.conversations.update_one(
+                {"id": chat_request.conversation_id},
+                {"$set": {"updated_at": datetime.now(timezone.utc).isoformat()}}
+            )
+            
+            yield f"data: {json.dumps({'content': '', 'done': True, 'message_id': assistant_message.id})}\n\n"
+        
+        return StreamingResponse(
+            generate_response(),
+            media_type="text/plain",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+            }
+        )
+        
+    except Exception as e:
+        logger.error(f"Error in chat endpoint: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Include the router in the main app
+app.include_router(api_router)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_credentials=True,
+    allow_origins=os.environ.get('CORS_ORIGINS', '*').split(','),
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+@app.on_event("shutdown")
+async def shutdown_db_client():
+    client.close()
