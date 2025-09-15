@@ -149,6 +149,82 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
     except jwt.PyJWTError:
         raise HTTPException(status_code=401, detail="Invalid token")
 
+# Authentication endpoints
+@api_router.post("/auth/register", response_model=AuthResponse)
+async def register(user_data: UserCreate):
+    try:
+        # Validate email
+        valid_email = validate_email(user_data.email)
+        user_data.email = valid_email.email
+    except EmailNotValidError:
+        raise HTTPException(status_code=400, detail="Invalid email address")
+    
+    # Check if user exists
+    existing_user = await db.users.find_one({"email": user_data.email})
+    if existing_user:
+        raise HTTPException(status_code=400, detail="Email already registered")
+    
+    # Hash password
+    password_hash = hash_password(user_data.password)
+    
+    # Create user
+    user = User(
+        name=user_data.name,
+        email=user_data.email,
+        password_hash=password_hash
+    )
+    
+    prepared_user = prepare_for_mongo(user.dict())
+    await db.users.insert_one(prepared_user)
+    
+    # Create token
+    token = create_access_token(user.id)
+    
+    # Return response
+    user_response = UserResponse(
+        id=user.id,
+        name=user.name,
+        email=user.email,
+        created_at=user.created_at
+    )
+    
+    return AuthResponse(token=token, user=user_response)
+
+@api_router.post("/auth/login", response_model=AuthResponse)
+async def login(login_data: UserLogin):
+    # Find user
+    user_doc = await db.users.find_one({"email": login_data.email})
+    if not user_doc:
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    
+    user = User(**parse_from_mongo(user_doc))
+    
+    # Verify password
+    if not verify_password(login_data.password, user.password_hash):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    
+    # Create token
+    token = create_access_token(user.id)
+    
+    # Return response
+    user_response = UserResponse(
+        id=user.id,
+        name=user.name,
+        email=user.email,
+        created_at=user.created_at
+    )
+    
+    return AuthResponse(token=token, user=user_response)
+
+@api_router.get("/auth/me", response_model=UserResponse)
+async def get_current_user_info(current_user: User = Depends(get_current_user)):
+    return UserResponse(
+        id=current_user.id,
+        name=current_user.name,
+        email=current_user.email,
+        created_at=current_user.created_at
+    )
+
 # Add your routes to the router instead of directly to app
 @api_router.get("/")
 async def root():
