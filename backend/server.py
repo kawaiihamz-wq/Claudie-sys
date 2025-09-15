@@ -75,6 +75,34 @@ class Conversation(BaseModel):
 class ConversationCreate(BaseModel):
     title: str = "New Chat"
 
+# User models for authentication
+class User(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    name: str
+    email: str
+    password_hash: str
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+class UserCreate(BaseModel):
+    name: str
+    email: str
+    password: str
+
+class UserLogin(BaseModel):
+    email: str
+    password: str
+
+class UserResponse(BaseModel):
+    id: str
+    name: str
+    email: str
+    created_at: datetime
+
+class AuthResponse(BaseModel):
+    token: str
+    user: UserResponse
+
 # Helper function to prepare data for MongoDB
 def prepare_for_mongo(data):
     if isinstance(data, dict):
