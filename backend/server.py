@@ -1,5 +1,6 @@
-from fastapi import FastAPI, APIRouter, HTTPException
+from fastapi import FastAPI, APIRouter, HTTPException, Depends
 from fastapi.responses import StreamingResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -9,9 +10,12 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 from typing import List, Optional, AsyncGenerator
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import json
 from emergentintegrations.llm.chat import LlmChat, UserMessage
+import jwt
+import bcrypt
+from email_validator import validate_email, EmailNotValidError
 
 
 ROOT_DIR = Path(__file__).parent
